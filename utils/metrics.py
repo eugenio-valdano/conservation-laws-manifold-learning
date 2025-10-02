@@ -3,16 +3,27 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import vmap
-from jax.experimental import maps
-from jax.experimental import PartitionSpec as P
+#from jax.experimental import maps
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 from jax.experimental.pjit import pjit
 
-from ott.core.sinkhorn import sinkhorn
-from ott.geometry.epsilon_scheduler import Epsilon
-from ott.geometry.pointcloud import PointCloud
-from ott.geometry.geometry import Geometry
+from ott.solvers.linear import sinkhorn
+from ott.geometry import pointcloud, geometry, epsilon_scheduler
+Epsilon = epsilon_scheduler.Epsilon
+PointCloud = pointcloud.PointCloud
+Geometry = geometry.Geometry
+
+from ott.geometry import costs
 
 from contextlib import nullcontext
+
+class PNormCost(costs.CostFn):
+    def __init__(self, p: float = 2.0):
+        self.p = p
+    def pairwise(self, x, y):
+        # cost(x,y) = ||x-y||_p ** p  (standard p-Wasserstein)
+        return jnp.linalg.norm(x - y, ord=self.p) ** self.p
 
 
 def _pairwise_vmap(func):
@@ -41,32 +52,35 @@ def wasserstein_metric(
     batch_size=None,
     **sinkhorn_kwargs,
 ):
+    # choose a cost function
+    # - p==2 and cost_fn is None: use PointCloud default (squared Euclidean)
+    # - otherwise: use provided cost_fn or a generic p-norm cost (||·||_p^p)
+    use_cost_fn = cost_fn if cost_fn is not None else (None if p == 2 else PNormCost(p=p))
+
     if geometry_type == "pointcloud":
+        geom = PointCloud(
+            x,
+            y,
+            cost_fn=use_cost_fn,                # None -> default squared Euclidean
+            epsilon=Epsilon(target=target,      # pass ε directly
+                            init=init,
+                            decay=decay),
+        )
         sol = sinkhorn(
-            PointCloud(
-                x,
-                y,
-                cost_fn=cost_fn,
-                power=p,
-                epsilon=Epsilon(
-                    target=target**p,
-                    init=init**p,
-                    decay=decay**p,
-                ),
-            ),
+            geom,
             threshold=threshold,
             max_iterations=max_iterations,
             **sinkhorn_kwargs,
         )
 
     elif geometry_type == "precompute":
+        # Build a cost matrix equal to distance^p
         if batch_size is None:
             M = (
                 cost_fn.norm(x)[:, None]
                 + cost_fn.norm(y)[None, :]
                 + _pairwise_vmap(cost_fn.pairwise)(x, y)
-            ) ** (0.5 * p)
-
+            ) ** (0.5 * p)   # (sqrt(·))^p = distance^p
         else:
             if not isinstance(batch_size, tuple):
                 batch_size = (batch_size, batch_size)
@@ -74,39 +88,32 @@ def wasserstein_metric(
                 _get_batch_ranges(x.shape[0], batch_size[0]),
                 _get_batch_ranges(y.shape[0], batch_size[1]),
             ]
-            M = jnp.block(
-                [
-                    [
-                        _pairwise_vmap(cost_fn.pairwise)(
-                            x[i_range[0] : i_range[1]], y[j_range[0] : j_range[1]]
-                        )
-                        for j_range in batch_ranges[0]
-                    ]
-                    for i_range in batch_ranges[1]
-                ]
-            )
+            M_blocks = []
+            for i_range in batch_ranges[0]:
+                row_blocks = []
+                for j_range in batch_ranges[1]:
+                    blk = _pairwise_vmap(cost_fn.pairwise)(
+                        x[i_range[0] : i_range[1]],
+                        y[j_range[0] : j_range[1]],
+                    )
+                    row_blocks.append(blk)
+                M_blocks.append(jnp.block(row_blocks))
+            M = jnp.block(M_blocks)
             M = (cost_fn.norm(x)[:, None] + cost_fn.norm(y)[None, :] + M) ** (0.5 * p)
 
+        geom = Geometry(
+            cost_matrix=M,
+            epsilon=Epsilon(target=target, init=init, decay=decay),  # no power
+        )
         sol = sinkhorn(
-            Geometry(
-                cost_matrix=M,
-                power=p,
-                epsilon=Epsilon(
-                    target=target**p,
-                    init=init**p,
-                    decay=decay**p,
-                ),
-            ),
+            geom,
             threshold=threshold,
             max_iterations=max_iterations,
             **sinkhorn_kwargs,
         )
 
-    # if M is not None:
-    #     return sol.reg_ot_cost, sol.converged, 10 * jnp.sum(sol.errors > -1), M
-
-    # cost matrix, converged, steps
     return sol.reg_ot_cost, sol.converged, 10 * jnp.sum(sol.errors > -1)
+
 
 
 def distance_matrix(
@@ -114,7 +121,7 @@ def distance_matrix(
 ):
     if mesh_shape is not None:
         devices = np.asarray(jax.devices()).reshape(*mesh_shape)
-        mesh = maps.Mesh(devices, ("x", "y"))
+        mesh = Mesh(devices, ("x", "y"))
 
         pairwise_cost = pjit(
             _pairwise_vmap(metric),
