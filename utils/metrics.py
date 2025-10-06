@@ -8,7 +8,9 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.experimental.pjit import pjit
 
-from ott.solvers.linear import sinkhorn
+#from ott.solvers.linear import sinkhorn
+from ott.solvers.linear.sinkhorn import Sinkhorn
+from ott.problems.linear import linear_problem as lp
 from ott.geometry import pointcloud, geometry, epsilon_scheduler
 Epsilon = epsilon_scheduler.Epsilon
 PointCloud = pointcloud.PointCloud
@@ -22,8 +24,8 @@ class PNormCost(costs.CostFn):
     def __init__(self, p: float = 2.0):
         self.p = p
     def pairwise(self, x, y):
-        # cost(x,y) = ||x-y||_p ** p  (standard p-Wasserstein)
-        return jnp.linalg.norm(x - y, ord=self.p) ** self.p
+        # cost(x,y) = ||x-y||_p ** p  (works for general p>=1)
+        return jnp.sum(jnp.abs(x - y) ** self.p)
 
 
 def _pairwise_vmap(func):
@@ -66,51 +68,47 @@ def wasserstein_metric(
                             init=init,
                             decay=decay),
         )
-        sol = sinkhorn(
-            geom,
+        #
+        solver = Sinkhorn(
             threshold=threshold,
             max_iterations=max_iterations,
             **sinkhorn_kwargs,
         )
+        prob = lp.LinearProblem(geom)           # <- wrap Geometry
+        sol = solver(prob)
 
+    #->
     elif geometry_type == "precompute":
-        # Build a cost matrix equal to distance^p
+        # Build cost matrix M = ||x - y||^p using a pairwise function
+        if cost_fn is None and p == 2:
+            def sqeuclid(a, b):  # squared L2
+                return jnp.sum((a - b) ** 2, axis=-1)
+            pair = _pairwise_vmap(sqeuclid)
+        else:
+            cf = use_cost_fn if use_cost_fn is not None else PNormCost(p=p)
+            pair = _pairwise_vmap(cf.pairwise)  # returns ||·||_p^p
+
         if batch_size is None:
-            M = (
-                cost_fn.norm(x)[:, None]
-                + cost_fn.norm(y)[None, :]
-                + _pairwise_vmap(cost_fn.pairwise)(x, y)
-            ) ** (0.5 * p)   # (sqrt(·))^p = distance^p
+            M = pair(x, y)
         else:
             if not isinstance(batch_size, tuple):
                 batch_size = (batch_size, batch_size)
-            batch_ranges = [
-                _get_batch_ranges(x.shape[0], batch_size[0]),
-                _get_batch_ranges(y.shape[0], batch_size[1]),
-            ]
-            M_blocks = []
-            for i_range in batch_ranges[0]:
+            xr = _get_batch_ranges(x.shape[0], batch_size[0])
+            yr = _get_batch_ranges(y.shape[0], batch_size[1])
+            rows = []
+            for i0, i1 in xr:
                 row_blocks = []
-                for j_range in batch_ranges[1]:
-                    blk = _pairwise_vmap(cost_fn.pairwise)(
-                        x[i_range[0] : i_range[1]],
-                        y[j_range[0] : j_range[1]],
-                    )
-                    row_blocks.append(blk)
-                M_blocks.append(jnp.block(row_blocks))
-            M = jnp.block(M_blocks)
-            M = (cost_fn.norm(x)[:, None] + cost_fn.norm(y)[None, :] + M) ** (0.5 * p)
+                for j0, j1 in yr:
+                    row_blocks.append(pair(x[i0:i1], y[j0:j1]))
+                rows.append(jnp.block(row_blocks))
+            M = jnp.block(rows)
 
-        geom = Geometry(
-            cost_matrix=M,
-            epsilon=Epsilon(target=target, init=init, decay=decay),  # no power
-        )
-        sol = sinkhorn(
-            geom,
-            threshold=threshold,
-            max_iterations=max_iterations,
-            **sinkhorn_kwargs,
-        )
+        geom = Geometry(cost_matrix=M,
+                        epsilon=Epsilon(target=target, init=init, decay=decay))
+        solver = Sinkhorn(threshold=threshold, max_iterations=max_iterations, **sinkhorn_kwargs)
+        prob = lp.LinearProblem(geom)
+        sol = solver(prob)
+    ###-#
 
     return sol.reg_ot_cost, sol.converged, 10 * jnp.sum(sol.errors > -1)
 
@@ -172,6 +170,9 @@ def distance_matrix(
 
     # symmetrize & debias, https://arxiv.org/pdf/2006.02575.pdf
     cost_diag = np.diag(cost_mat)
-    dist_mat = ((cost_mat + cost_mat.T - cost_diag - cost_diag[:, None]) / 2) ** (1 / p)
+    dist_mat = ((cost_mat + cost_mat.T - cost_diag - cost_diag[:, None]) / 2)
+    assert dist_mat.min() < 1e-2, 'TOO NEGATIVE!'
+    dist_mat = np.clip(dist_mat, 0., None)  # enforce positivity, avoid spurious small neg
+    dist_mat = dist_mat ** (1 / p)
 
     return dist_mat, converged, steps
